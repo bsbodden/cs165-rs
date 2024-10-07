@@ -31,6 +31,7 @@ struct Database {
 struct ServerState {
     current_db: Option<Database>,
     results: HashMap<String, Vec<i32>>,
+    float_results: HashMap<String, Vec<f64>>,
 }
 
 fn main() -> io::Result<()> {
@@ -40,6 +41,7 @@ fn main() -> io::Result<()> {
         ServerState {
             current_db: None,
             results: HashMap::new(),
+            float_results: HashMap::new(),
         }
     })));
 
@@ -142,6 +144,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<Mutex<ServerState>>, running:
 }
 
 fn process_command(command: &str, state: &mut ServerState, running: &Arc<AtomicBool>) -> String {
+    println!("DEBUG: Processing command: {}", command);
     let parts: Vec<&str> = command.split('=').collect();
 
     if parts.len() == 2 {
@@ -152,6 +155,8 @@ fn process_command(command: &str, state: &mut ServerState, running: &Arc<AtomicB
             return handle_select(destination, &operation[7..operation.len() - 1], state);
         } else if operation.starts_with("fetch(") {
             return handle_fetch(destination, &operation[6..operation.len() - 1], state);
+        } else if operation.starts_with("avg(") {
+            return handle_avg(destination,&operation[4..operation.len() - 1], state);
         }
     }
 
@@ -325,6 +330,14 @@ fn handle_print(args: &str, state: &ServerState) -> String {
 
         // Add an extra newline at the end
         format!("{}\n", output)
+    } else if let Some(float_result) = state.float_results.get(result_name) {
+        println!("DEBUG: Found float result");
+
+        // Handle float results
+        float_result
+            .iter()
+            .map(|&value| format!("{:.2}\n", value))
+            .collect()
     } else {
         format!("-- Error: Result '{}' not found", result_name)
     }
@@ -441,6 +454,28 @@ fn handle_shutdown(state: &mut ServerState, running: &Arc<AtomicBool>) -> String
     running.store(false, Ordering::SeqCst);
     save_database(state).unwrap_or_else(|e| eprintln!("Error saving database: {}", e));
     "-- Shutting down the server".to_string()
+}
+
+fn handle_avg(destination: &str, args: &str, state: &mut ServerState) -> String {
+    let source = args.trim();
+    println!("DEBUG: Calculating average for '{}'", source);
+    if let Some(result) = state.results.get(source) {
+        let sum: i64 = result.iter().map(|&x| x as i64).sum();
+        let count = result.len();
+        if count > 0 {
+            let average = (sum as f64) / (count as f64);
+            let new_result = vec![average];
+            state.float_results.insert(destination.to_string(), new_result);
+            println!("DEBUG: Average calculated and stored in float_results");
+            "-- Average calculated\n".to_string()
+        } else {
+            println!("DEBUG: Cannot calculate average of empty result");
+            "-- Error: Cannot calculate average of empty result\n".to_string()
+        }
+    } else {
+        println!("DEBUG: Source '{}' not found for average calculation", source);
+        format!("-- Error: Source '{}' not found\n", source)
+    }
 }
 
 fn show_tables(state: &ServerState) -> String {
