@@ -174,6 +174,7 @@ fn process_command(
             handle_load(parts[1].trim_end_matches(')'), state, stream)
         }
         "print" => handle_print(parts[1].trim_end_matches(')'), state),
+        "relational_insert" => handle_relational_insert(parts[1].trim_end_matches(')'), state),
         "show_tables" => show_tables(state),
         "display_table" | "display" => {
             if parts.len() > 1 {
@@ -570,6 +571,42 @@ fn handle_avg(destination: &str, args: &str, state: &mut ServerState) -> String 
             source
         );
         format!("-- Error: Source '{}' not found\n", source)
+    }
+}
+
+fn handle_relational_insert(args: &str, state: &mut ServerState) -> String {
+    let parts: Vec<&str> = args.split(',').collect();
+    if parts.len() < 2 {
+        return "-- Error: Invalid relational_insert command\n".to_string();
+    }
+
+    let table_ref = parts[0];
+    let values: Vec<i32> = parts[1..]
+        .iter()
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+
+    if let Some(db) = &mut state.current_db {
+        let table_parts: Vec<&str> = table_ref.split('.').collect();
+        if table_parts.len() != 2 || table_parts[0] != db.name {
+            return "-- Error: Invalid table reference\n".to_string();
+        }
+
+        if let Some(table) = db.tables.get_mut(table_parts[1]) {
+            if values.len() != table.columns.len() {
+                return format!("-- Error: Expected {} values, got {}\n", table.columns.len(), values.len());
+            }
+
+            for (i, value) in values.iter().enumerate() {
+                table.columns[i].data.push(*value);
+            }
+
+            "-- Row inserted\n".to_string()
+        } else {
+            "-- Error: Table not found\n".to_string()
+        }
+    } else {
+        "-- Error: No active database\n".to_string()
     }
 }
 
