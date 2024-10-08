@@ -98,7 +98,39 @@ fn run_interactive_mode() -> io::Result<()> {
             break;
         }
 
-        stream.write_all(input.as_bytes())?;
+        if trimmed_input.starts_with("load") {
+            // Extract file path from the command
+            let file_path = trimmed_input.split('(').nth(1).unwrap().trim_end_matches(')');
+            let file_path = file_path.trim_matches('"');
+
+            // Read file contents
+            let mut file = File::open(file_path)?;
+            let mut contents = Vec::new();
+            file.read_to_end(&mut contents)?;
+
+            // Send command with file size
+            let file_size = contents.len();
+            let modified_command = format!("load({})\n", file_size);
+            println!("Sending command: {}", modified_command.trim());
+            stream.write_all(modified_command.as_bytes())?;
+            stream.flush()?;
+
+            // Wait for server acknowledgment
+            let mut ack = [0u8; 3];
+            stream.read_exact(&mut ack)?;
+            if &ack != b"ACK" {
+                eprintln!("Server did not acknowledge load command");
+                continue;
+            }
+
+            // Send file contents
+            println!("Sending {} bytes of file content", file_size);
+            stream.write_all(&contents)?;
+            println!("File content sent");
+        } else {
+            stream.write_all(trimmed_input.as_bytes())?;
+            stream.write_all(b"\n")?;
+        }
         stream.flush()?;
 
         match receive_response(&mut stream) {
