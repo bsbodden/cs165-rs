@@ -1,3 +1,4 @@
+use std::fs::File;
 use std::io::{self, BufRead, Read, Write};
 use std::net::TcpStream;
 
@@ -28,8 +29,42 @@ fn main() -> io::Result<()> {
 fn execute_command(command: &str) -> io::Result<()> {
     let mut stream = TcpStream::connect("127.0.0.1:8080")?;
 
-    stream.write_all(command.as_bytes())?;
-    stream.write_all(b"\n")?;
+    if command.starts_with("load") {
+        // Extract file path from the command
+        let file_path = command.split('(').nth(1).unwrap().trim_end_matches(')');
+        let file_path = file_path.trim_matches('"');
+
+        // Read file contents
+        let mut file = File::open(file_path)?;
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)?;
+
+        // Send command with file size
+        let file_size = contents.len();
+        let modified_command = format!("load({})\n", file_size);
+        println!("Sending command: {}", modified_command.trim());
+        stream.write_all(modified_command.as_bytes())?;
+        stream.flush()?;
+
+        // Wait for server acknowledgment
+        let mut ack = [0u8; 3];
+        stream.read_exact(&mut ack)?;
+        if &ack != b"ACK" {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Server did not acknowledge load command",
+            ));
+        }
+
+        // Send file contents
+        println!("Sending {} bytes of file content", file_size);
+        stream.write_all(&contents)?;
+        println!("File content sent");
+    } else {
+        stream.write_all(command.as_bytes())?;
+        stream.write_all(b"\n")?;
+    }
+
     stream.flush()?;
 
     let response = receive_response(&mut stream)?;

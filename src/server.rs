@@ -2,8 +2,8 @@ use bincode::{Decode, Encode};
 use memmap2::MmapMut;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, ErrorKind, Write};
+use std::fs::OpenOptions;
+use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -117,7 +117,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<Mutex<ServerState>>, running:
                 println!("Received command: {}", buffer.trim());
                 let response = {
                     let mut state_guard = state.lock().unwrap();
-                    process_command(buffer.trim(), &mut state_guard, &running)
+                    process_command(buffer.trim(), &mut state_guard, &running, &mut stream)
                 };
 
                 println!("Processed command, sending response");
@@ -143,7 +143,12 @@ fn handle_client(mut stream: TcpStream, state: Arc<Mutex<ServerState>>, running:
     println!("Client handler exiting");
 }
 
-fn process_command(command: &str, state: &mut ServerState, running: &Arc<AtomicBool>) -> String {
+fn process_command(
+    command: &str,
+    state: &mut ServerState,
+    running: &Arc<AtomicBool>,
+    stream: &mut TcpStream,
+) -> String {
     println!("DEBUG: Processing command: {}", command);
     let parts: Vec<&str> = command.split('=').collect();
 
@@ -156,7 +161,7 @@ fn process_command(command: &str, state: &mut ServerState, running: &Arc<AtomicB
         } else if operation.starts_with("fetch(") {
             return handle_fetch(destination, &operation[6..operation.len() - 1], state);
         } else if operation.starts_with("avg(") {
-            return handle_avg(destination,&operation[4..operation.len() - 1], state);
+            return handle_avg(destination, &operation[4..operation.len() - 1], state);
         }
     }
 
@@ -164,7 +169,10 @@ fn process_command(command: &str, state: &mut ServerState, running: &Arc<AtomicB
 
     match parts[0].trim() {
         "create" => handle_create(parts[1].trim_end_matches(')'), state),
-        "load" => handle_load(parts[1].trim_end_matches(')'), state),
+        "load" => {
+            println!("DEBUG: Detected load command");
+            handle_load(parts[1].trim_end_matches(')'), state, stream)
+        }
         "print" => handle_print(parts[1].trim_end_matches(')'), state),
         "show_tables" => show_tables(state),
         "display_table" | "display" => {
@@ -273,41 +281,123 @@ fn create_column(col_name: &str, table_ref: &str, state: &mut ServerState) -> St
     }
 }
 
-fn handle_load(file_path: &str, state: &mut ServerState) -> String {
-    println!("Attempting to load data from: {}", file_path);
-    load_data(file_path.trim_matches('"'), state)
+fn handle_load(args: &str, state: &mut ServerState, stream: &mut TcpStream) -> String {
+    println!("Entering handle_load with args: {}", args);
+
+    let file_size: usize = match args.trim().parse() {
+        Ok(size) => {
+            println!("Parsed file size: {} bytes", size);
+            size
+        }
+        Err(e) => {
+            println!("Error parsing file size: {}", e);
+            return format!("-- Error: Invalid file size: {}\n", e);
+        }
+    };
+
+    // Send acknowledgment to client
+    if let Err(e) = stream.write_all(b"ACK") {
+        println!("Error sending acknowledgment: {}", e);
+        return format!("-- Error sending acknowledgment: {}\n", e);
+    }
+    if let Err(e) = stream.flush() {
+        println!("Error flushing stream after acknowledgment: {}", e);
+        return format!("-- Error flushing stream: {}\n", e);
+    }
+
+    println!("Attempting to read {} bytes from stream", file_size);
+    let mut file_contents = vec![0u8; file_size];
+
+    match stream.read_exact(&mut file_contents) {
+        Ok(_) => {
+            println!("Successfully read {} bytes", file_size);
+            println!(
+                "First 100 bytes of file contents: {:?}",
+                &file_contents[..100.min(file_contents.len())]
+            );
+            println!("Calling load_data");
+            load_data(&file_contents, state)
+        }
+        Err(e) => {
+            println!("Error reading file contents: {}", e);
+            format!("-- Error reading file contents: {}\n", e)
+        }
+    }
 }
 
-fn load_data(file_path: &str, state: &mut ServerState) -> String {
+fn load_data(file_contents: &[u8], state: &mut ServerState) -> String {
+    println!("Entering load_data");
+
     if let Some(db) = &mut state.current_db {
-        let file = File::open(file_path).unwrap();
-        let reader = BufReader::new(file);
+        println!("Current database: {}", db.name);
+
+        let reader = BufReader::new(file_contents);
         let mut lines = reader.lines();
 
         // Read header
-        let _header = lines.next().unwrap().unwrap();
-        let _column_names: Vec<&str> = _header.split(',').collect();
+        match lines.next() {
+            Some(Ok(header)) => {
+                println!("Header: {}", header);
+                let column_names: Vec<&str> = header.split(',').collect();
+                println!("Column names: {:?}", column_names);
+            }
+            Some(Err(e)) => {
+                println!("Error reading header: {}", e);
+                return format!("-- Error reading header: {}\n", e);
+            }
+            None => {
+                println!("Error: Empty file");
+                return "-- Error: Empty file\n".to_string();
+            }
+        }
 
         // Assume we're loading into the last created table
         if let Some(table) = db.tables.values_mut().last() {
-            for line in lines {
-                let values: Vec<i32> = line
-                    .unwrap()
-                    .split(',')
-                    .map(|s| s.parse().unwrap())
-                    .collect();
+            println!("Loading into table: {}", table.name);
+            let mut row_count = 0;
 
-                for (i, value) in values.iter().enumerate() {
-                    if i < table.columns.len() {
-                        table.columns[i].data.push(*value);
+            for (i, line) in lines.enumerate() {
+                match line {
+                    Ok(line) => {
+                        let values: Vec<i32> = line
+                            .split(',')
+                            .map(|s| {
+                                s.parse().unwrap_or_else(|e| {
+                                    println!("Error parsing value in row {}: {}", i + 2, e);
+                                    0 // or some default value
+                                })
+                            })
+                            .collect();
+
+                        if i < 5 {
+                            // Print first 5 rows for debugging
+                            println!("Row {}: {:?}", i + 2, values);
+                        }
+
+                        for (j, value) in values.iter().enumerate() {
+                            if j < table.columns.len() {
+                                table.columns[j].data.push(*value);
+                            }
+                        }
+                        row_count += 1;
+                    }
+                    Err(e) => {
+                        println!("Error reading line {}: {}", i + 2, e);
                     }
                 }
             }
-            format!("-- Data loaded into table '{}'\n", table.name)
+
+            println!("Loaded {} rows into table '{}'", row_count, table.name);
+            format!(
+                "-- Data loaded into table '{}'. {} rows inserted.\n",
+                table.name, row_count
+            )
         } else {
+            println!("Error: No tables in the current database");
             "-- Error: No tables in the current database\n".to_string()
         }
     } else {
+        println!("Error: No active database");
         "-- Error: No active database\n".to_string()
     }
 }
@@ -465,7 +555,9 @@ fn handle_avg(destination: &str, args: &str, state: &mut ServerState) -> String 
         if count > 0 {
             let average = (sum as f64) / (count as f64);
             let new_result = vec![average];
-            state.float_results.insert(destination.to_string(), new_result);
+            state
+                .float_results
+                .insert(destination.to_string(), new_result);
             println!("DEBUG: Average calculated and stored in float_results");
             "-- Average calculated\n".to_string()
         } else {
@@ -473,7 +565,10 @@ fn handle_avg(destination: &str, args: &str, state: &mut ServerState) -> String 
             "-- Error: Cannot calculate average of empty result\n".to_string()
         }
     } else {
-        println!("DEBUG: Source '{}' not found for average calculation", source);
+        println!(
+            "DEBUG: Source '{}' not found for average calculation",
+            source
+        );
         format!("-- Error: Source '{}' not found\n", source)
     }
 }
