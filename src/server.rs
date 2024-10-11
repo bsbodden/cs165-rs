@@ -168,6 +168,10 @@ fn process_command(
             return handle_add(destination, &operation[4..operation.len() - 1], state);
         } else if operation.starts_with("sub(") {
             return handle_sub(destination, &operation[4..operation.len() - 1], state);
+        } else if operation.starts_with("min(") {
+            return handle_min_max(destination, &operation[4..operation.len() - 1], state, true);
+        } else if operation.starts_with("max(") {
+            return handle_min_max(destination, &operation[4..operation.len() - 1], state, false);
         }
     }
 
@@ -677,6 +681,68 @@ fn handle_sub(destination: &str, args: &str, state: &mut ServerState) -> String 
     } else {
         "-- Error: One or both vectors not found\n".to_string()
     }
+}
+
+fn handle_min_max(destination: &str, args: &str, state: &mut ServerState, is_min: bool) -> String {
+    let is_column = args.contains('.');
+    let result = if is_column {
+        min_max_column(args, state, is_min)
+    } else {
+        min_max_result(args, state, is_min)
+    };
+
+    match result {
+        Ok(value) => {
+            state.results.insert(destination.to_string(), vec![value]);
+            if is_min {
+                "-- Min calculated\n".to_string()
+            } else {
+                "-- Max calculated\n".to_string()
+            }
+        }
+        Err(e) => e,
+    }
+}
+
+fn min_max_column(col_name: &str, state: &ServerState, is_min: bool) -> Result<i64, String> {
+    if let Some(db) = &state.current_db {
+        let parts: Vec<&str> = col_name.split('.').collect();
+        if parts.len() != 3 || parts[0] != db.name {
+            return Err("-- Error: Invalid column reference\n".to_string());
+        }
+        if let Some(table) = db.tables.get(parts[1]) {
+            if let Some(column) = table.columns.iter().find(|c| c.name == parts[2]) {
+                let result = if is_min {
+                    column.data.iter().min()
+                } else {
+                    column.data.iter().max()
+                };
+                result.map(|&x| x as i64).ok_or_else(|| "-- Error: Empty column\n".to_string())
+            } else {
+                Err("-- Error: Column not found\n".to_string())
+            }
+        } else {
+            Err("-- Error: Table not found\n".to_string())
+        }
+    } else {
+        Err("-- Error: No active database\n".to_string())
+    }
+}
+
+fn min_max_result(source: &str, state: &ServerState, is_min: bool) -> Result<i64, String> {
+    state.results.get(source)
+        .ok_or_else(|| format!("-- Error: Source '{}' not found\n", source))
+        .and_then(|result| {
+            if result.is_empty() {
+                Err("-- Error: Empty result\n".to_string())
+            } else {
+                Ok(if is_min {
+                    *result.iter().min().unwrap()
+                } else {
+                    *result.iter().max().unwrap()
+                })
+            }
+        })
 }
 
 fn show_tables(state: &ServerState) -> String {
