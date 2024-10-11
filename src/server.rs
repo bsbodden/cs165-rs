@@ -30,7 +30,7 @@ struct Database {
 #[derive(Serialize, Deserialize, Clone, Encode, Decode)]
 struct ServerState {
     current_db: Option<Database>,
-    results: HashMap<String, Vec<i32>>,
+    results: HashMap<String, Vec<i64>>,
     float_results: HashMap<String, Vec<f64>>,
 }
 
@@ -162,6 +162,8 @@ fn process_command(
             return handle_fetch(destination, &operation[6..operation.len() - 1], state);
         } else if operation.starts_with("avg(") {
             return handle_avg(destination, &operation[4..operation.len() - 1], state);
+        } else if operation.starts_with("sum(") {
+            return handle_sum(destination, &operation[4..operation.len() - 1], state);
         }
     }
 
@@ -169,10 +171,7 @@ fn process_command(
 
     match parts[0].trim() {
         "create" => handle_create(parts[1].trim_end_matches(')'), state),
-        "load" => {
-            println!("DEBUG: Detected load command");
-            handle_load(parts[1].trim_end_matches(')'), state, stream)
-        }
+        "load" => handle_load(parts[1].trim_end_matches(')'), state, stream),
         "print" => handle_print(parts[1].trim_end_matches(')'), state),
         "relational_insert" => handle_relational_insert(parts[1].trim_end_matches(')'), state),
         "show_tables" => show_tables(state),
@@ -283,15 +282,11 @@ fn create_column(col_name: &str, table_ref: &str, state: &mut ServerState) -> St
 }
 
 fn handle_load(args: &str, state: &mut ServerState, stream: &mut TcpStream) -> String {
-    println!("Entering handle_load with args: {}", args);
-
     let file_size: usize = match args.trim().parse() {
         Ok(size) => {
-            println!("Parsed file size: {} bytes", size);
             size
         }
         Err(e) => {
-            println!("Error parsing file size: {}", e);
             return format!("-- Error: Invalid file size: {}\n", e);
         }
     };
@@ -311,119 +306,106 @@ fn handle_load(args: &str, state: &mut ServerState, stream: &mut TcpStream) -> S
 
     match stream.read_exact(&mut file_contents) {
         Ok(_) => {
-            println!("Successfully read {} bytes", file_size);
-            println!(
-                "First 100 bytes of file contents: {:?}",
-                &file_contents[..100.min(file_contents.len())]
-            );
-            println!("Calling load_data");
-            load_data(&file_contents, state)
+            match load_data(&file_contents, state) {
+                Ok(message) => {
+                    message
+                }
+                Err(error) => {
+                    format!("-- Error: {}\n", error)
+                }
+            }
         }
         Err(e) => {
-            println!("Error reading file contents: {}", e);
             format!("-- Error reading file contents: {}\n", e)
         }
     }
 }
 
-fn load_data(file_contents: &[u8], state: &mut ServerState) -> String {
-    println!("Entering load_data");
+fn load_data(file_contents: &[u8], state: &mut ServerState) -> Result<String, String> {
+    let db = state.current_db.as_mut().ok_or("No active database")?;
 
-    if let Some(db) = &mut state.current_db {
-        println!("Current database: {}", db.name);
+    let reader = BufReader::new(file_contents);
+    let mut lines = reader.lines();
 
-        let reader = BufReader::new(file_contents);
-        let mut lines = reader.lines();
+    // Read header
+    let header = lines.next().ok_or("Empty file")?.map_err(|e| e.to_string())?;
+    let column_names: Vec<&str> = header.split(',').collect();
 
-        // Read header
-        match lines.next() {
-            Some(Ok(header)) => {
-                println!("Header: {}", header);
-                let column_names: Vec<&str> = header.split(',').collect();
-                println!("Column names: {:?}", column_names);
-            }
-            Some(Err(e)) => {
-                println!("Error reading header: {}", e);
-                return format!("-- Error reading header: {}\n", e);
-            }
-            None => {
-                println!("Error: Empty file");
-                return "-- Error: Empty file\n".to_string();
-            }
-        }
+    // Extract table name from the first column name
+    let table_name = column_names[0].split('.').nth(1).ok_or("Invalid column name format")?;
 
-        // Assume we're loading into the last created table
-        if let Some(table) = db.tables.values_mut().last() {
-            println!("Loading into table: {}", table.name);
-            let mut row_count = 0;
+    // Find the correct table
+    let table = db.tables.get_mut(table_name).ok_or_else(|| format!("Table '{}' not found in the database", table_name))?;
 
-            for (i, line) in lines.enumerate() {
-                match line {
-                    Ok(line) => {
-                        let values: Vec<i32> = line
-                            .split(',')
-                            .map(|s| {
-                                s.parse().unwrap_or_else(|e| {
-                                    println!("Error parsing value in row {}: {}", i + 2, e);
-                                    0 // or some default value
-                                })
-                            })
-                            .collect();
-
-                        if i < 5 {
-                            // Print first 5 rows for debugging
-                            println!("Row {}: {:?}", i + 2, values);
-                        }
-
-                        for (j, value) in values.iter().enumerate() {
-                            if j < table.columns.len() {
-                                table.columns[j].data.push(*value);
-                            }
-                        }
-                        row_count += 1;
-                    }
-                    Err(e) => {
-                        println!("Error reading line {}: {}", i + 2, e);
-                    }
-                }
-            }
-
-            println!("Loaded {} rows into table '{}'", row_count, table.name);
-            format!(
-                "-- Data loaded into table '{}'. {} rows inserted.\n",
-                table.name, row_count
-            )
-        } else {
-            println!("Error: No tables in the current database");
-            "-- Error: No tables in the current database\n".to_string()
-        }
-    } else {
-        println!("Error: No active database");
-        "-- Error: No active database\n".to_string()
+    // Verify column count
+    if table.columns.len() != column_names.len() {
+        return Err(format!("Mismatch in column count. Expected {}, got {}", table.columns.len(), column_names.len()));
     }
+
+    // Verify column names
+    for (i, col_name) in column_names.iter().enumerate() {
+        let expected_name = format!("{}.{}.{}", db.name, table_name, table.columns[i].name);
+        if *col_name != expected_name {
+            return Err(format!("Column name mismatch. Expected '{}', got '{}'", expected_name, col_name));
+        }
+    }
+
+    let mut row_count = 0;
+
+    // Process data rows
+    for (i, line) in lines.enumerate() {
+        let line = line.map_err(|e| e.to_string())?;
+        let values: Result<Vec<i32>, _> = line.split(',').map(str::parse).collect();
+        match values {
+            Ok(values) => {
+                if values.len() != table.columns.len() {
+                    return Err(format!("Invalid number of values in row {}. Expected {}, got {}",
+                                       i + 2, table.columns.len(), values.len()));
+                }
+                for (j, value) in values.iter().enumerate() {
+                    table.columns[j].data.push(*value);
+                }
+                row_count += 1;
+            },
+            Err(_) => return Err(format!("Invalid data type in row {}", i + 2)),
+        }
+    }
+
+    // Ensure consistent state
+    for col in &mut table.columns {
+        if col.data.len() != row_count {
+            return Err(format!("Inconsistent data length in column '{}'. Expected {}, got {}",
+                               col.name, row_count, col.data.len()));
+        }
+    }
+
+    Ok(format!("Data loaded into table '{}'. {} rows inserted.", table.name, row_count))
 }
 
 fn handle_print(args: &str, state: &ServerState) -> String {
     let result_name = args.trim();
 
     if let Some(result) = state.results.get(result_name) {
-        // Find the maximum number of digits
-        let max_digits = result
-            .iter()
-            .map(|&value| value.to_string().len())
-            .max()
-            .unwrap_or(0);
+        if result.len() == 1 {
+            // Single result
+            format!("{}\n", result[0])
+        } else {
+            // Find the maximum number of digits
+            let max_digits = result
+                .iter()
+                .map(|&value| value.to_string().len())
+                .max()
+                .unwrap_or(0);
 
-        let output: String = result
-            .iter()
-            .map(|&value| format!("{:>width$}\n", value, width = max_digits))
-            .collect();
+            let output: String = result
+                .iter()
+                .map(|&value| format!("{:>width$}\n", value, width = max_digits))
+                .collect();
 
-        // Add an extra newline at the end
-        format!("{}\n", output)
+            // Add an extra newline at the end
+            format!("{}\n", output)
+        }
     } else if let Some(float_result) = state.float_results.get(result_name) {
-        println!("DEBUG: Found float result");
-
         // Handle float results
         float_result
             .iter()
@@ -444,12 +426,12 @@ fn handle_select(destination: &str, args: &str, state: &mut ServerState) -> Stri
     let low = if parts[1].trim() == "null" {
         None
     } else {
-        parts[1].trim().parse().ok()
+        parts[1].trim().parse::<i32>().ok()
     };
     let high = if parts[2].trim() == "null" {
         None
     } else {
-        parts[2].trim().parse().ok()
+        parts[2].trim().parse::<i32>().ok()
     };
 
     select(destination, col_name, low, high, state)
@@ -469,7 +451,7 @@ fn select(
         }
         if let Some(table) = db.tables.get(parts[1]) {
             if let Some(column) = table.columns.iter().find(|c| c.name == parts[2]) {
-                let result: Vec<i32> = column
+                let result: Vec<i64> = column
                     .data
                     .iter()
                     .enumerate()
@@ -477,12 +459,10 @@ fn select(
                         (low.is_none() || value >= low.unwrap())
                             && (high.is_none() || value < high.unwrap())
                     })
-                    .map(|(index, _)| index as i32)
+                    .map(|(index, _)| index as i64)  // Convert to i64 here
                     .collect();
 
-                state
-                    .results
-                    .insert(destination.to_string(), result.clone());
+                state.results.insert(destination.to_string(), result.clone());
 
                 format!("-- Selected {} rows\n", result.len())
             } else {
@@ -517,11 +497,11 @@ fn fetch(destination: &str, col_name: &str, pos_name: &str, state: &mut ServerSt
         if let Some(table) = db.tables.get(parts[1]) {
             if let Some(column) = table.columns.iter().find(|c| c.name == parts[2]) {
                 if let Some(positions) = state.results.get(pos_name) {
-                    let result: Vec<i32> = positions
+                    let result: Vec<i64> = positions
                         .iter()
                         .filter_map(|&pos| {
                             let usize_pos = pos as usize;
-                            column.data.get(usize_pos).copied()
+                            column.data.get(usize_pos).map(|&x| x as i64)
                         })
                         .collect();
                     let result_len = result.len();
@@ -549,9 +529,8 @@ fn handle_shutdown(state: &mut ServerState, running: &Arc<AtomicBool>) -> String
 
 fn handle_avg(destination: &str, args: &str, state: &mut ServerState) -> String {
     let source = args.trim();
-    println!("DEBUG: Calculating average for '{}'", source);
     if let Some(result) = state.results.get(source) {
-        let sum: i64 = result.iter().map(|&x| x as i64).sum();
+        let sum: i64 = result.iter().map(|&x| x).sum();
         let count = result.len();
         if count > 0 {
             let average = (sum as f64) / (count as f64);
@@ -559,17 +538,11 @@ fn handle_avg(destination: &str, args: &str, state: &mut ServerState) -> String 
             state
                 .float_results
                 .insert(destination.to_string(), new_result);
-            println!("DEBUG: Average calculated and stored in float_results");
             "-- Average calculated\n".to_string()
         } else {
-            println!("DEBUG: Cannot calculate average of empty result");
             "-- Error: Cannot calculate average of empty result\n".to_string()
         }
     } else {
-        println!(
-            "DEBUG: Source '{}' not found for average calculation",
-            source
-        );
         format!("-- Error: Source '{}' not found\n", source)
     }
 }
@@ -610,8 +583,55 @@ fn handle_relational_insert(args: &str, state: &mut ServerState) -> String {
     }
 }
 
+fn handle_sum(destination: &str, args: &str, state: &mut ServerState) -> String {
+    let is_column = args.contains('.');
+    let result = if is_column {
+        sum_column(args, state)
+    } else {
+        sum_result(args, state)
+    };
+
+    match result {
+        Ok(sum) => {
+            // println!("DEBUG: Sum calculated: {}", sum);
+            state.results.insert(destination.to_string(), vec![sum]);
+            "-- Sum calculated\n".to_string()
+        }
+        Err(e) => e,
+    }
+}
+
+fn sum_result(source: &str, state: &ServerState) -> Result<i64, String> {
+    state.results.get(source)
+        .ok_or_else(|| format!("-- Error: Source '{}' not found\n", source))
+        .map(|result| {
+            let sum = result.iter().map(|&x| x).sum();
+            sum
+        })
+}
+
+fn sum_column(col_name: &str, state: &ServerState) -> Result<i64, String> {
+    if let Some(db) = &state.current_db {
+        let parts: Vec<&str> = col_name.split('.').collect();
+        if parts.len() != 3 || parts[0] != db.name {
+            return Err("-- Error: Invalid column reference\n".to_string());
+        }
+        if let Some(table) = db.tables.get(parts[1]) {
+            if let Some(column) = table.columns.iter().find(|c| c.name == parts[2]) {
+                let sum = column.data.iter().map(|&x| x as i64).sum();
+                Ok(sum)
+            } else {
+                Err("-- Error: Column not found\n".to_string())
+            }
+        } else {
+            Err("-- Error: Table not found\n".to_string())
+        }
+    } else {
+        Err("-- Error: No active database\n".to_string())
+    }
+}
+
 fn show_tables(state: &ServerState) -> String {
-    println!("Entering show_tables function"); // Debug print
     if let Some(db) = &state.current_db {
         let mut output = format!("Database: {}\n\n", db.name);
         output.push_str("| Table Name |\n");
@@ -634,7 +654,6 @@ fn show_tables(state: &ServerState) -> String {
 }
 
 fn display_table(table_name: &str, state: &ServerState) -> String {
-    println!("Entering display_table function for table: {}", table_name); // Debug print
     if let Some(db) = &state.current_db {
         if let Some(table) = db.tables.get(table_name) {
             let mut output = format!("Table: {}\n\n", table_name);
