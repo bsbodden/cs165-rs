@@ -164,6 +164,8 @@ fn process_command(
             return handle_avg(destination, &operation[4..operation.len() - 1], state);
         } else if operation.starts_with("sum(") {
             return handle_sum(destination, &operation[4..operation.len() - 1], state);
+        } else if operation.starts_with("add(") {
+            return handle_add(destination, &operation[4..operation.len() - 1], state);
         }
     }
 
@@ -628,6 +630,28 @@ fn sum_column(col_name: &str, state: &ServerState) -> Result<i64, String> {
         }
     } else {
         Err("-- Error: No active database\n".to_string())
+    }
+}
+
+fn handle_add(destination: &str, args: &str, state: &mut ServerState) -> String {
+    let parts: Vec<&str> = args.split(',').collect();
+    if parts.len() != 2 {
+        return "-- Error: Invalid add command\n".to_string();
+    }
+
+    let vector1_name = parts[0].trim();
+    let vector2_name = parts[1].trim();
+
+    if let (Some(vector1), Some(vector2)) = (state.results.get(vector1_name), state.results.get(vector2_name)) {
+        if vector1.len() != vector2.len() {
+            return "-- Error: Vectors have different lengths\n".to_string();
+        }
+
+        let result: Vec<i64> = vector1.iter().zip(vector2.iter()).map(|(&a, &b)| a + b).collect();
+        state.results.insert(destination.to_string(), result);
+        "-- Addition completed\n".to_string()
+    } else {
+        "-- Error: One or both vectors not found\n".to_string()
     }
 }
 
