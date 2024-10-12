@@ -391,61 +391,99 @@ fn load_data(file_contents: &[u8], state: &mut ServerState) -> Result<String, St
 }
 
 fn handle_print(args: &str, state: &ServerState) -> String {
-    let result_name = args.trim();
+    let result_names: Vec<&str> = args.split(',').map(str::trim).collect();
+    let mut output = String::new();
+    let mut is_multi_line = false;
 
-    if let Some(result) = state.results.get(result_name) {
-        if result.len() == 1 {
-            // Single result
-            format!("{}\n", result[0])
+    for (i, &result_name) in result_names.iter().enumerate() {
+        if let Some(result) = state.results.get(result_name) {
+            if result.is_empty() {
+                continue;
+            }
+            if result_names.len() == 1 && result.len() > 1 {
+                // Multi-line output for single variable with multiple results
+                is_multi_line = true;
+                let max_digits = result.iter().map(|&value| value.to_string().len()).max().unwrap_or(0);
+                output = result.iter()
+                    .map(|&value| format!("{:>width$}\n", value, width = max_digits))
+                    .collect();
+            } else {
+                // Single line output
+                output.push_str(&result[0].to_string());
+            }
+        } else if let Some(float_result) = state.float_results.get(result_name) {
+            if float_result.is_empty() {
+                continue;
+            }
+            if result_names.len() == 1 && float_result.len() > 1 {
+                // Multi-line output for single variable with multiple float results
+                is_multi_line = true;
+                output = float_result.iter()
+                    .map(|&value| format!("{:.2}\n", value))
+                    .collect();
+            } else {
+                // Single line output
+                output.push_str(&format!("{:.2}", float_result[0]));
+            }
         } else {
-            // Find the maximum number of digits
-            let max_digits = result
-                .iter()
-                .map(|&value| value.to_string().len())
-                .max()
-                .unwrap_or(0);
-
-            let output: String = result
-                .iter()
-                .map(|&value| format!("{:>width$}\n", value, width = max_digits))
-                .collect();
-
-            // Add an extra newline at the end
-            format!("{}\n", output)
+            return format!("-- Error: Result '{}' not found", result_name);
         }
-    } else if let Some(float_result) = state.float_results.get(result_name) {
-        // Handle float results
-        float_result
-            .iter()
-            .map(|&value| format!("{:.2}\n", value))
-            .collect()
+
+        if !is_multi_line && i < result_names.len() - 1 {
+            output.push(',');
+        }
+    }
+
+    if !is_multi_line {
+        output.push('\n');
+    }
+
+    if is_multi_line {
+        format!("{}\n", output)
     } else {
-        format!("-- Error: Result '{}' not found", result_name)
+        output
     }
 }
 
 fn handle_select(destination: &str, args: &str, state: &mut ServerState) -> String {
     let parts: Vec<&str> = args.split(',').collect();
-    if parts.len() != 3 {
+    if parts.len() != 3 && parts.len() != 4 {
         return "-- Error: Invalid select command\n".to_string();
     }
 
-    let col_name = parts[0].trim();
-    let low = if parts[1].trim() == "null" {
-        None
+    if parts.len() == 4 {
+        // This is a select from result: s2=select(s1,sf1,-2358,804)
+        let prev_result = parts[0].trim();
+        let values = parts[1].trim();
+        let low = if parts[2].trim() == "null" {
+            None
+        } else {
+            parts[2].trim().parse::<i32>().ok()
+        };
+        let high = if parts[3].trim() == "null" {
+            None
+        } else {
+            parts[3].trim().parse::<i32>().ok()
+        };
+        select_from_result(destination, prev_result, values, low, high, state)
     } else {
-        parts[1].trim().parse::<i32>().ok()
-    };
-    let high = if parts[2].trim() == "null" {
-        None
-    } else {
-        parts[2].trim().parse::<i32>().ok()
-    };
-
-    select(destination, col_name, low, high, state)
+        // This is a select from column: s1=select(db1.tbl2.col1,-2384,778)
+        let col_name = parts[0].trim();
+        let low = if parts[1].trim() == "null" {
+            None
+        } else {
+            parts[1].trim().parse::<i32>().ok()
+        };
+        let high = if parts[2].trim() == "null" {
+            None
+        } else {
+            parts[2].trim().parse::<i32>().ok()
+        };
+        select_from_column(destination, col_name, low, high, state)
+    }
 }
 
-fn select(
+fn select_from_column(
     destination: &str,
     col_name: &str,
     low: Option<i32>,
@@ -481,6 +519,32 @@ fn select(
         }
     } else {
         "-- Error: No active database\n".to_string()
+    }
+}
+
+fn select_from_result(
+    destination: &str,
+    prev_result: &str,
+    values: &str,
+    low: Option<i32>,
+    high: Option<i32>,
+    state: &mut ServerState,
+) -> String {
+    if let (Some(positions), Some(val_vec)) = (state.results.get(prev_result), state.results.get(values)) {
+        let result: Vec<i64> = positions
+            .iter()
+            .zip(val_vec.iter())
+            .filter(|(_, &value)| {
+                (low.is_none() || value >= low.unwrap() as i64)
+                    && (high.is_none() || value < high.unwrap() as i64)
+            })
+            .map(|(&pos, _)| pos)
+            .collect();
+
+        state.results.insert(destination.to_string(), result.clone());
+        format!("-- Selected {} rows\n", result.len())
+    } else {
+        "-- Error: Previous result or values not found\n".to_string()
     }
 }
 
